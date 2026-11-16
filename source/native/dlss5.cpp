@@ -174,6 +174,9 @@ struct PresentStage {
     // motion vectors at the extent belong to the slot's feature.
     ComPtr<ID3D12Resource> color;
     PresentInputs inputs=PresentInputs::eNeutral;
+    // Each capture producer has its own fence. Hold the identity across frames so a
+    // recycled capture slot cannot make a different DLSS feature look like the old one.
+    ComPtr<ID3D12Fence> lastCaptureWriter;
     // Logged once: how the presentation queue and NGX's device are layered
     // when a wrapper such as ReShade sits between them.
     bool layersLogged=false;
@@ -456,6 +459,17 @@ float3 HaloCorrection(uint2 id,float3 inL,float3 nrL,float g,float white){
   if(f>0&&all(isfinite(r)))written=float4(EncodeOutput(r),source.a);
   // Compare: the original left of the split (right of it with Swap sides), and a divider on it.
   bool left=float(id.x)<split;
+#ifdef MFG_D3D12_SOFT_COMPARE
+  if(flags&1024){
+   // Match the Uplift example mask's two-percent feather on each side.
+   float feather=0.02*float(size.x);
+   float weight=smoothstep(split-feather,split+feather,float(id.x)+0.5);
+   if(flags&128)weight=1-weight;
+   if(weight==0)written=source;
+   else if(weight<1&&f>0&&all(isfinite(r)))
+     written=float4(EncodeOutput(lerp(base,r,weight)),source.a);
+  }else
+#endif
   if((flags&32)&&((flags&128)?!left:left))written=source;
   // White core (2 px at 1080p, 3 at 4K; 200 nits in HDR) in 1 px black edges.
   if(flags&64){
@@ -1083,10 +1097,11 @@ bool PipelineFor(ID3D12Device* device) noexcept {
     ComPtr<ID3D12PipelineState>* const states[]{&gPipeline.encode,&gPipeline.decode,&gPipeline.copy,&gPipeline.meter,
         &gPipeline.hold,&gPipeline.carry,&gPipeline.compose,&gPipeline.fit,&gPipeline.solve};
     static_assert(std::size(entries)==std::size(states));
+    const D3D_SHADER_MACRO decodeDefines[]={{"MFG_D3D12_SOFT_COMPARE","1"},{nullptr,nullptr}};
     for(unsigned i=0;i<std::size(entries);++i){
         const char* const source=i<4?kShader:kBoostShader;
         const size_t length=i<4?sizeof(kShader)-1:sizeof(kBoostShader)-1;
-        if(FAILED(D3DCompile(source,length,"MFGUnlocker DLSS 5",nullptr,nullptr,entries[i],"cs_5_1",
+        if(FAILED(D3DCompile(source,length,"MFGUnlocker DLSS 5",i==1?decodeDefines:nullptr,nullptr,entries[i],"cs_5_1",
             D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&binary,&error))){
             if(error){
                 wchar_t message[1024]{};
@@ -1760,7 +1775,7 @@ Constants PassConstantsFor(const Frame& frame,const Settings& wanted,uint32_t ex
         const bool held=wanted.compareKey && PhysicalKeyDown(static_cast<int>(wanted.compareKey)) && ProcessInForeground();
         if(held){c.flags|=32u;c.split=static_cast<float>(frame.width);}
         else if(wanted.compare){
-            c.flags|=32u|(wanted.compareSwap?128u:0u);c.split=std::round(static_cast<float>(frame.width)*wanted.compareSplit/100.0f);
+            c.flags|=32u|1024u|(wanted.compareSwap?128u:0u);c.split=std::round(static_cast<float>(frame.width)*wanted.compareSplit/100.0f);
             // The overlay's divider over the finished image replaces this one.
             const bool overlay=GetTickCount64()-gOverlayDividerTick.load(std::memory_order_acquire)<500;
             if(!overlay && wanted.stage!=static_cast<uint32_t>(Stage::eRender))c.flags|=64u;
@@ -2240,7 +2255,9 @@ bool ProcessPresent(PresentStage& stage,const PresentTarget& target,const Settin
         slot.resetHistory=true;gState=State::eMissingInputs;return false;
     }
     if(inputs!=PresentInputs::eCaptured)capture=nullptr;
-    if(inputs!=stage.inputs){stage.inputs=inputs;slot.resetHistory=true;}
+    ID3D12Fence* captureWriter=capture?capture->writer.Get():nullptr;
+    if(inputs!=stage.inputs || captureWriter!=stage.lastCaptureWriter.Get())
+        slot.resetHistory=true;
     if(!stage.list){
         for(auto& allocator:stage.allocators)
             if(FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(allocator.ReleaseAndGetAddressOf()))))
@@ -2257,7 +2274,14 @@ bool ProcessPresent(PresentStage& stage,const PresentTarget& target,const Settin
     if(FAILED(stage.allocators[allocator]->Reset()) || FAILED(stage.list->Reset(stage.allocators[allocator].Get(),nullptr)))
         return PresentRefused(L"command list reset");
     const bool processed=RecordPresent(stage,target,wanted,image,device.Get(),capture);
-    return SubmitPresent(stage,queue,native,allocator,processed?capture:nullptr) && processed;
+    const bool submitted=SubmitPresent(stage,queue,native,allocator,processed?capture:nullptr);
+    if(!processed || !submitted){
+        slot.resetHistory=true;
+        return false;
+    }
+    stage.inputs=inputs;
+    stage.lastCaptureWriter=captureWriter;
+    return true;
 }
 }
 void Configure(Settings settings) noexcept {
